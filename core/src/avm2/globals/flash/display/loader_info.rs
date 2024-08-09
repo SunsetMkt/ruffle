@@ -157,6 +157,7 @@ pub fn get_content<'gc>(
                 if root.movie().is_action_script_3() || !root.movie().is_movie() {
                     return Ok(root.object2());
                 } else {
+                    // The movie was an AVM1 movie, return an AVM1Movie object
                     let root_obj = *root;
                     drop(loader_stream);
 
@@ -433,7 +434,7 @@ pub fn get_bytes<'gc>(
         );
     }
 
-    let mut ba_write = ba.as_bytearray_mut(activation.context.gc_context).unwrap();
+    let mut ba_write = ba.as_bytearray_mut().unwrap();
 
     // First, write a fake header corresponding to an
     // uncompressed SWF

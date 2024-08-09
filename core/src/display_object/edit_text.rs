@@ -18,12 +18,11 @@ use crate::display_object::interactive::{
     InteractiveObject, InteractiveObjectBase, TInteractiveObject,
 };
 use crate::display_object::{DisplayObjectBase, DisplayObjectPtr};
-use crate::drawing::Drawing;
 use crate::events::{ClipEvent, ClipEventResult, TextControlCode};
-use crate::font::{round_down_to_pixel, FontType, Glyph, TextRenderSettings};
+use crate::font::{FontType, Glyph, TextRenderSettings};
 use crate::html;
 use crate::html::{
-    FormatSpans, Layout, LayoutBox, LayoutContent, LayoutMetrics, Position, TextFormat,
+    FormatSpans, Layout, LayoutBox, LayoutContent, LayoutLine, LayoutMetrics, Position, TextFormat,
 };
 use crate::prelude::*;
 use crate::string::{utils as string_utils, AvmString, SwfStrExt as _, WStr, WString};
@@ -35,10 +34,9 @@ use core::fmt;
 use either::Either;
 use gc_arena::{Collect, Gc, GcCell, Mutation};
 use ruffle_render::commands::CommandHandler;
-use ruffle_render::shape_utils::DrawCommand;
+use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::Transform;
 use ruffle_wstr::WStrToUtf8;
-use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::{cell::Ref, cell::RefMut, sync::Arc};
 use swf::ColorTransform;
@@ -105,10 +103,6 @@ pub struct EditTextData<'gc> {
     #[collect(require_static)]
     border_color: Color,
 
-    /// The current border drawing.
-    #[collect(require_static)]
-    drawing: Drawing,
-
     /// Whether the width of the field should change in response to text
     /// changes, and in what direction the added or removed width should
     /// apply.
@@ -174,6 +168,10 @@ pub struct EditTextData<'gc> {
     /// Restrict what characters the user may input.
     #[collect(require_static)]
     restrict: EditTextRestrict,
+
+    /// Information related to the last click event inside this text field.
+    #[collect(require_static)]
+    last_click: Option<ClickEventData>,
 }
 
 impl<'gc> EditTextData<'gc> {
@@ -211,6 +209,7 @@ impl<'gc> EditText<'gc> {
                 &text,
                 default_format,
                 swf_tag.is_multiline(),
+                false,
                 swf_movie.version(),
             )
         } else {
@@ -288,7 +287,6 @@ impl<'gc> EditText<'gc> {
                 flags,
                 background_color: Color::WHITE,
                 border_color: Color::BLACK,
-                drawing: Drawing::new(),
                 object: None,
                 layout,
                 bounds: swf_tag.bounds().clone(),
@@ -305,13 +303,12 @@ impl<'gc> EditText<'gc> {
                 mouse_wheel_enabled: true,
                 is_tlf: false,
                 restrict: EditTextRestrict::allow_all(),
+                last_click: None,
             },
         ));
 
         if swf_tag.is_auto_size() {
             et.relayout(context);
-        } else {
-            et.redraw_border(context.gc_context);
         }
 
         et
@@ -397,6 +394,7 @@ impl<'gc> EditText<'gc> {
                 text,
                 default_format,
                 write.flags.contains(EditTextFlag::MULTILINE),
+                write.flags.contains(EditTextFlag::CONDENSE_WHITE),
                 write.static_data.swf.version(),
             );
             drop(write);
@@ -538,7 +536,7 @@ impl<'gc> EditText<'gc> {
             .write(gc_context)
             .flags
             .set(EditTextFlag::HAS_BACKGROUND, has_background);
-        self.redraw_border(gc_context);
+        self.invalidate_cached_bitmap(gc_context);
     }
 
     pub fn background_color(self) -> Color {
@@ -547,7 +545,7 @@ impl<'gc> EditText<'gc> {
 
     pub fn set_background_color(self, gc_context: &Mutation<'gc>, background_color: Color) {
         self.0.write(gc_context).background_color = background_color;
-        self.redraw_border(gc_context);
+        self.invalidate_cached_bitmap(gc_context);
     }
 
     pub fn has_border(self) -> bool {
@@ -559,7 +557,7 @@ impl<'gc> EditText<'gc> {
             .write(gc_context)
             .flags
             .set(EditTextFlag::BORDER, has_border);
-        self.redraw_border(gc_context);
+        self.invalidate_cached_bitmap(gc_context);
     }
 
     pub fn border_color(self) -> Color {
@@ -568,7 +566,32 @@ impl<'gc> EditText<'gc> {
 
     pub fn set_border_color(self, gc_context: &Mutation<'gc>, border_color: Color) {
         self.0.write(gc_context).border_color = border_color;
-        self.redraw_border(gc_context);
+        self.invalidate_cached_bitmap(gc_context);
+    }
+
+    pub fn condense_white(self) -> bool {
+        self.0.read().flags.contains(EditTextFlag::CONDENSE_WHITE)
+    }
+
+    pub fn set_condense_white(self, context: &mut UpdateContext<'_, 'gc>, condense_white: bool) {
+        self.0
+            .write(context.gc())
+            .flags
+            .set(EditTextFlag::CONDENSE_WHITE, condense_white);
+    }
+
+    pub fn always_show_selection(self) -> bool {
+        self.0
+            .read()
+            .flags
+            .contains(EditTextFlag::ALWAYS_SHOW_SELECTION)
+    }
+
+    pub fn set_always_show_selection(self, context: &mut UpdateContext<'_, 'gc>, value: bool) {
+        self.0
+            .write(context.gc())
+            .flags
+            .set(EditTextFlag::ALWAYS_SHOW_SELECTION, value);
     }
 
     pub fn is_device_font(self) -> bool {
@@ -709,48 +732,6 @@ impl<'gc> EditText<'gc> {
     /// The `text_transform` constitutes the base transform that all text is
     /// written into.
 
-    /// Redraw the border of this `EditText`.
-    fn redraw_border(self, gc_context: &Mutation<'gc>) {
-        let mut write = self.0.write(gc_context);
-
-        write.drawing.clear();
-
-        if write
-            .flags
-            .intersects(EditTextFlag::BORDER | EditTextFlag::HAS_BACKGROUND)
-        {
-            let line_style = write.flags.contains(EditTextFlag::BORDER).then_some(
-                swf::LineStyle::new()
-                    .with_width(Twips::new(1))
-                    .with_color(write.border_color),
-            );
-            write.drawing.set_line_style(line_style);
-
-            let fill_style = write
-                .flags
-                .contains(EditTextFlag::HAS_BACKGROUND)
-                .then_some(swf::FillStyle::Color(write.background_color));
-            write.drawing.set_fill_style(fill_style);
-
-            let width = write.bounds.width();
-            let height = write.bounds.height();
-            write.drawing.draw_command(DrawCommand::MoveTo(Point::ZERO));
-            write
-                .drawing
-                .draw_command(DrawCommand::LineTo(Point::new(Twips::ZERO, height)));
-            write
-                .drawing
-                .draw_command(DrawCommand::LineTo(Point::new(width, height)));
-            write
-                .drawing
-                .draw_command(DrawCommand::LineTo(Point::new(width, Twips::ZERO)));
-            write.drawing.draw_command(DrawCommand::LineTo(Point::ZERO));
-        }
-
-        drop(write);
-        self.invalidate_cached_bitmap(gc_context);
-    }
-
     /// Internal padding between the bounds of the EditText and the text.
     /// Applies to each side.
     const INTERNAL_PADDING: f64 = 2.0;
@@ -834,7 +815,6 @@ impl<'gc> EditText<'gc> {
             edit_text.bounds.set_height(height);
         }
         drop(edit_text);
-        self.redraw_border(context.gc_context);
         self.invalidate_cached_bitmap(context.gc_context);
     }
 
@@ -855,11 +835,10 @@ impl<'gc> EditText<'gc> {
             return 0.0;
         }
 
-        let base = round_down_to_pixel(
-            edit_text.layout.exterior_bounds().width() - edit_text.bounds.width(),
-        )
-        .to_pixels()
-        .max(0.0);
+        let base = (edit_text.layout.exterior_bounds().width() - edit_text.bounds.width())
+            .trunc_to_pixel()
+            .to_pixels()
+            .max(0.0);
 
         // input text boxes get extra space at the end
         if !edit_text.flags.contains(EditTextFlag::READ_ONLY) {
@@ -941,18 +920,23 @@ impl<'gc> EditText<'gc> {
             ..Default::default()
         });
 
-        let visible_selection = if self.has_focus() {
+        let focused = self.has_focus();
+        let visible_selection = if focused {
             edit_text.selection
+        } else if self.always_show_selection() {
+            // Caret is not shown even if alwaysShowSelection is true
+            edit_text.selection.filter(|sel| !sel.is_caret())
         } else {
             None
         };
 
         let caret = if let LayoutContent::Text { start, end, .. } = &lbox.content() {
             if let Some(visible_selection) = visible_selection {
+                let text_len = edit_text.text_spans.text().len();
                 if visible_selection.is_caret()
                     && !edit_text.flags.contains(EditTextFlag::READ_ONLY)
                     && visible_selection.start() >= *start
-                    && visible_selection.end() <= *end
+                    && (visible_selection.end() < *end || *end == text_len)
                     && !visible_selection.blinks_now()
                 {
                     Some(visible_selection.start() - start)
@@ -992,8 +976,8 @@ impl<'gc> EditText<'gc> {
                     if let Some(glyph_shape_handle) = glyph.shape_handle(context.renderer) {
                         // If it's highlighted, override the color.
                         if matches!(visible_selection, Some(visible_selection) if visible_selection.contains(start + pos)) {
-                            // Draw black selection rect
-                            self.render_selection(context, x, advance, caret_height);
+                            // Draw selection rect
+                            self.render_selection(context, x, advance, caret_height, focused);
 
                             // Set text color to white
                             context.transform_stack.push(&Transform {
@@ -1041,16 +1025,17 @@ impl<'gc> EditText<'gc> {
         x: Twips,
         width: Twips,
         height: Twips,
+        focused: bool,
     ) {
+        let color = if focused { Color::BLACK } else { Color::GRAY };
         let selection_box = context.transform_stack.transform().matrix
             * Matrix::create_box(
                 width.to_pixels() as f32,
                 height.to_pixels() as f32,
-                0.0,
                 x,
                 Twips::ZERO,
             );
-        context.commands.draw_rect(Color::BLACK, selection_box);
+        context.commands.draw_rect(color, selection_box);
     }
 
     fn render_caret(
@@ -1060,16 +1045,17 @@ impl<'gc> EditText<'gc> {
         height: Twips,
         color: Color,
     ) {
-        let cursor_width = Twips::from_pixels(1.0);
-        let caret = context.transform_stack.transform().matrix
-            * Matrix::create_box(
-                cursor_width.to_pixels() as f32,
+        let mut caret = context.transform_stack.transform().matrix
+            * Matrix::create_box_with_rotation(
+                1.0,
                 height.to_pixels() as f32,
-                0.0,
-                x - cursor_width,
+                std::f32::consts::FRAC_PI_2,
+                x,
                 Twips::ZERO,
             );
-        context.commands.draw_rect(color, caret);
+        let pixel_snapping = EditTextPixelSnapping::new(context.stage.quality());
+        pixel_snapping.apply(&mut caret);
+        context.commands.draw_line(color, caret);
     }
 
     /// Attempts to bind this text field to a property of a display object.
@@ -1224,6 +1210,24 @@ impl<'gc> EditText<'gc> {
         }
     }
 
+    /// Calculate and return the [`TextSelection`] at the given position
+    /// using the given selection mode.
+    fn calculate_selection_at(self, position: usize, mode: TextSelectionMode) -> TextSelection {
+        match mode {
+            TextSelectionMode::Character => TextSelection::for_position(position),
+            TextSelectionMode::Word => {
+                let from = self.find_prev_word_boundary(position, true);
+                let to = self.find_next_word_boundary(position, true);
+                TextSelection::for_range(from, to)
+            }
+            TextSelectionMode::Line => {
+                let from = self.find_prev_line_boundary(position);
+                let to = self.find_next_line_boundary(position);
+                TextSelection::for_range(from, to)
+            }
+        }
+    }
+
     pub fn reset_selection_blinking(self, gc_context: &Mutation<'gc>) {
         if let Some(selection) = self.0.write(gc_context).selection.as_mut() {
             selection.reset_blinking();
@@ -1282,39 +1286,32 @@ impl<'gc> EditText<'gc> {
         position.x += Twips::from_pixels(Self::INTERNAL_PADDING) + Twips::from_pixels(text.hscroll);
         position.y += Twips::from_pixels(Self::INTERNAL_PADDING) + text.vertical_scroll_offset();
 
-        // First determine which *row* of text is the closest match to the Y position...
-        let mut closest_row_extent_y = None;
-        for layout_box in text.layout.boxes_iter() {
-            if layout_box.is_text_box() {
-                if let Some(closest_extent_y) = closest_row_extent_y {
-                    if layout_box.bounds().extent_y() > closest_extent_y
-                        && position.y >= layout_box.bounds().offset_y()
-                    {
-                        closest_row_extent_y = Some(layout_box.bounds().extent_y());
-                    }
-                } else {
-                    closest_row_extent_y = Some(layout_box.bounds().extent_y());
+        // TODO We can use binary search for both y and x here
+
+        // First determine which line of text is the closest match to the Y position...
+        let mut closest_line: Option<&LayoutLine> = None;
+        for line in text.layout.lines().iter() {
+            if let Some(closest_extent_y) = closest_line.map(|l| l.bounds().extent_y()) {
+                if line.bounds().extent_y() > closest_extent_y
+                    && position.y >= line.bounds().offset_y()
+                {
+                    closest_line = Some(line);
                 }
+            } else {
+                closest_line = Some(line);
             }
         }
 
-        // ...then find the box within that row that is the closest match to the X position.
+        // ...then find the box within that line that is the closest match to the X position.
         let mut closest_layout_box: Option<&LayoutBox<'gc>> = None;
-        if let Some(closest_extent_y) = closest_row_extent_y {
-            for layout_box in text.layout.boxes_iter() {
+        if let Some(line) = closest_line {
+            for layout_box in line.boxes_iter() {
                 if layout_box.is_text_box() {
-                    match layout_box.bounds().extent_y().cmp(&closest_extent_y) {
-                        Ordering::Less => {}
-                        Ordering::Equal => {
-                            if position.x >= layout_box.bounds().offset_x()
-                                || closest_layout_box.is_none()
-                            {
-                                closest_layout_box = Some(layout_box);
-                            } else {
-                                break;
-                            }
-                        }
-                        Ordering::Greater => break,
+                    if position.x >= layout_box.bounds().offset_x() || closest_layout_box.is_none()
+                    {
+                        closest_layout_box = Some(layout_box);
+                    } else {
+                        break;
                     }
                 }
             }
@@ -1609,10 +1606,10 @@ impl<'gc> EditText<'gc> {
             }
             TextControlCode::SelectRightWord
             | TextControlCode::MoveRightWord
-            | TextControlCode::DeleteWord => self.find_next_word_boundary(current_pos),
+            | TextControlCode::DeleteWord => self.find_next_word_boundary(current_pos, false),
             TextControlCode::SelectLeftWord
             | TextControlCode::MoveLeftWord
-            | TextControlCode::BackspaceWord => self.find_prev_word_boundary(current_pos),
+            | TextControlCode::BackspaceWord => self.find_prev_word_boundary(current_pos, false),
             TextControlCode::SelectRightLine | TextControlCode::MoveRightLine => {
                 self.find_next_line_boundary(current_pos)
             }
@@ -1627,12 +1624,17 @@ impl<'gc> EditText<'gc> {
         }
     }
 
-    /// Find the nearest word boundary before `pos`,
+    /// Find the nearest word boundary before (or exceptionally at) `pos`,
     /// which is applicable for selection.
     ///
+    /// When `stop_on_space` is true, `pos` will be returned if there's space before it.
+    ///
     /// This algorithm is based on [UAX #29](https://unicode.org/reports/tr29/).
-    fn find_prev_word_boundary(self, pos: usize) -> usize {
+    fn find_prev_word_boundary(self, pos: usize, stop_on_space: bool) -> usize {
         let head = &self.text()[..pos];
+        if stop_on_space && head.ends_with(ruffle_wstr::utils::swf_is_whitespace) {
+            return pos;
+        }
         let to_utf8 = WStrToUtf8::new(head);
         WordBoundIndices::new(&to_utf8.to_utf8_lossy())
             .rev()
@@ -1642,12 +1644,17 @@ impl<'gc> EditText<'gc> {
             .unwrap_or(0)
     }
 
-    /// Find the nearest word boundary after `pos`,
+    /// Find the nearest word boundary after (or exceptionally at) `pos`,
     /// which is applicable for selection.
     ///
+    /// When `stop_on_space` is true, `pos` will be returned if there's space after it.
+    ///
     /// This algorithm is based on [UAX #29](https://unicode.org/reports/tr29/).
-    fn find_next_word_boundary(self, pos: usize) -> usize {
+    fn find_next_word_boundary(self, pos: usize, stop_on_space: bool) -> usize {
         let tail = &self.text()[pos..];
+        if stop_on_space && tail.starts_with(ruffle_wstr::utils::swf_is_whitespace) {
+            return pos;
+        }
         let to_utf8 = WStrToUtf8::new(tail);
         WordBoundIndices::new(&to_utf8.to_utf8_lossy())
             .skip_while(|(_, span)| span.trim().is_empty())
@@ -1935,6 +1942,45 @@ impl<'gc> EditText<'gc> {
         self.0.read().layout.find_line_index_by_position(index)
     }
 
+    pub fn paragraph_start_index_at(self, mut index: usize) -> Option<usize> {
+        let text = self.text();
+
+        // Note that the index may equal the text length
+        if index > text.len() {
+            return None;
+        }
+
+        while index > 0 && !string_utils::swf_is_newline(text.at(index - 1)) {
+            index -= 1;
+        }
+
+        Some(index)
+    }
+
+    pub fn paragraph_length_at(self, mut index: usize) -> Option<usize> {
+        let start_index = self.paragraph_start_index_at(index)?;
+        let text = self.text();
+        let length = text.len();
+
+        // When the index is equal to the text length,
+        // FP simulates a character at that point and returns
+        // the length of the last paragraph plus one.
+        if index == length {
+            return Some(1 + length - start_index);
+        }
+
+        while index < length && !string_utils::swf_is_newline(text.at(index)) {
+            index += 1;
+        }
+
+        // The trailing newline also counts to the length
+        if index < length && string_utils::swf_is_newline(text.at(index)) {
+            index += 1;
+        }
+
+        Some(index - start_index)
+    }
+
     fn execute_avm1_asfunction(
         self,
         context: &mut UpdateContext<'_, 'gc>,
@@ -2000,6 +2046,52 @@ impl<'gc> EditText<'gc> {
                     .bounds()
                     .contains(Position::from((position.x, position.y)))
         })
+    }
+
+    fn handle_click(
+        self,
+        click_index: usize,
+        position: usize,
+        context: &mut UpdateContext<'_, 'gc>,
+    ) {
+        if !self.is_selectable() {
+            return;
+        }
+
+        let this_click = ClickEventData {
+            position,
+            click_index,
+        };
+        let selection_mode = this_click.selection_mode();
+        self.0.write(context.gc()).last_click = Some(this_click);
+
+        // Update selection
+        let selection = self.calculate_selection_at(position, selection_mode);
+        self.set_selection(Some(selection), context.gc());
+    }
+
+    fn handle_drag(self, position: usize, context: &mut UpdateContext<'_, 'gc>) {
+        if !self.is_selectable() {
+            return;
+        }
+
+        let Some((last_position, selection_mode)) = self
+            .0
+            .read()
+            .last_click
+            .as_ref()
+            .map(|last_click| (last_click.position, last_click.selection_mode()))
+        else {
+            // No last click, so no drag
+            return;
+        };
+
+        // We have to calculate selections at the first and the current position,
+        // because the user may be selecting words or lines.
+        let first_selection = self.calculate_selection_at(last_position, selection_mode);
+        let current_selection = self.calculate_selection_at(position, selection_mode);
+        let new_selection = TextSelection::span_across(first_selection, current_selection);
+        self.set_selection(Some(new_selection), context.gc());
     }
 }
 
@@ -2103,7 +2195,7 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
         let offset = edit_text.bounds.x_min;
         edit_text.base.base.set_x(x - offset);
         drop(edit_text);
-        self.redraw_border(gc_context);
+        self.invalidate_cached_bitmap(gc_context);
     }
 
     fn y(&self) -> Twips {
@@ -2117,7 +2209,7 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
         let offset = edit_text.bounds.y_min;
         edit_text.base.base.set_y(y - offset);
         drop(edit_text);
-        self.redraw_border(gc_context);
+        self.invalidate_cached_bitmap(gc_context);
     }
 
     fn width(&self) -> f64 {
@@ -2152,7 +2244,7 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
 
     fn set_matrix(&self, gc_context: &Mutation<'gc>, matrix: Matrix) {
         self.0.write(gc_context).base.base.set_matrix(matrix);
-        self.redraw_border(gc_context);
+        self.invalidate_cached_bitmap(gc_context);
     }
 
     fn render_self(&self, context: &mut RenderContext<'_, 'gc>) {
@@ -2161,19 +2253,54 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
             return;
         }
 
+        fn is_transform_positive_scale_only(context: &mut RenderContext) -> bool {
+            let Matrix { a, b, c, d, .. } = context.transform_stack.transform().matrix;
+            b == 0.0 && c == 0.0 && a > 0.0 && d > 0.0
+        }
+
+        // EditText is not rendered if device font is used
+        // and if it's rotated, sheared, or reflected.
+        if self.is_device_font() && !is_transform_positive_scale_only(context) {
+            return;
+        }
+
         let edit_text = self.0.read();
+
+        if edit_text
+            .flags
+            .intersects(EditTextFlag::BORDER | EditTextFlag::HAS_BACKGROUND)
+        {
+            let background_color = Some(edit_text.background_color)
+                .filter(|_| edit_text.flags.contains(EditTextFlag::HAS_BACKGROUND));
+            let border_color = Some(edit_text.border_color)
+                .filter(|_| edit_text.flags.contains(EditTextFlag::BORDER));
+
+            if self.is_device_font() {
+                self.draw_device_text_box(
+                    context,
+                    edit_text.bounds.clone(),
+                    background_color,
+                    border_color,
+                );
+            } else {
+                self.draw_text_box(
+                    context,
+                    edit_text.bounds.clone(),
+                    background_color,
+                    border_color,
+                );
+            }
+        }
+
         context.transform_stack.push(&Transform {
             matrix: Matrix::translate(edit_text.bounds.x_min, edit_text.bounds.y_min),
             ..Default::default()
         });
 
-        edit_text.drawing.render(context);
-
         context.commands.push_mask();
         let mask = Matrix::create_box(
             edit_text.bounds.width().to_pixels() as f32,
             edit_text.bounds.height().to_pixels() as f32,
-            0.0,
             Twips::ZERO,
             Twips::ZERO,
         );
@@ -2194,26 +2321,7 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
             ..Default::default()
         });
 
-        if edit_text.layout.boxes_iter().next().is_none()
-            && !edit_text.flags.contains(EditTextFlag::READ_ONLY)
         {
-            // TODO should not be possible
-            let visible_selection = if self.has_focus() {
-                edit_text.selection
-            } else {
-                None
-            };
-            if let Some(visible_selection) = visible_selection {
-                if visible_selection.is_caret()
-                    && visible_selection.start() == 0
-                    && !visible_selection.blinks_now()
-                {
-                    let format = edit_text.text_spans.default_format();
-                    let caret_height = format.size.map(Twips::from_pixels).unwrap_or_default();
-                    self.render_caret(context, Twips::ZERO, caret_height, Color::BLACK);
-                }
-            }
-        } else {
             let draw_boxes = edit_text.flags.contains(EditTextFlag::DRAW_LAYOUT_BOXES);
             if draw_boxes {
                 context.draw_rect_outline(
@@ -2273,7 +2381,141 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
                 .retain(|&text_field| !DisplayObject::ptr_eq(text_field.into(), (*self).into()));
         }
 
+        context
+            .audio_manager
+            .stop_sounds_with_display_object(context.audio, (*self).into());
+
         self.set_avm1_removed(context.gc_context, true);
+    }
+}
+
+impl<'gc> EditText<'gc> {
+    /// Draw the box (border + background) for EditText with device fonts.
+    ///
+    /// Notes on FP's behavior:
+    ///  * the box is never drawn when there's any rotation, shear, or reflection,
+    ///  * the box is always aliased and lines lie on whole pixels regardless of quality,
+    ///  * line width of the border is always 1px regardless of zoom and transform,
+    ///  * the bottom-right corner of the border is missing.
+    ///
+    /// Notes on the current implementation:
+    ///  * the border is drawn using four separately drawn lines,
+    ///  * the lines are always snapped to whole pixels (which is easy as
+    ///    the possible transforms are highly limited),
+    ///  * the current implementation should be pixel-perfect (compared to FP).
+    pub fn draw_device_text_box(
+        &self,
+        context: &mut RenderContext<'_, 'gc>,
+        bounds: Rectangle<Twips>,
+        background_color: Option<Color>,
+        border_color: Option<Color>,
+    ) {
+        let transform = context.transform_stack.transform();
+        let bounds = transform.matrix * bounds;
+
+        let width_twips = bounds.width().round_to_pixel_ties_even();
+        let height_twips = bounds.height().round_to_pixel_ties_even();
+        let bounds = Rectangle {
+            x_min: bounds.x_min.round_to_pixel_ties_even(),
+            x_max: bounds.x_min.round_to_pixel_ties_even() + width_twips,
+            y_min: bounds.y_min.round_to_pixel_ties_even(),
+            y_max: bounds.y_min.round_to_pixel_ties_even() + height_twips,
+        };
+
+        let width = width_twips.to_pixels() as f32;
+        let height = height_twips.to_pixels() as f32;
+        if let Some(background_color) = background_color {
+            let background_color = &transform.color_transform * background_color;
+            context.commands.draw_rect(
+                background_color,
+                Matrix::create_box(width, height, bounds.x_min, bounds.y_min),
+            );
+        }
+
+        if let Some(border_color) = border_color {
+            let border_color = &transform.color_transform * border_color;
+            // Top
+            context.commands.draw_line(
+                border_color,
+                Matrix::create_box(width, 1.0, bounds.x_min - Twips::HALF, bounds.y_min),
+            );
+            // Bottom
+            context.commands.draw_line(
+                border_color,
+                Matrix::create_box(width, 1.0, bounds.x_min - Twips::HALF, bounds.y_max),
+            );
+            // Left
+            context.commands.draw_line(
+                border_color,
+                Matrix::create_box_with_rotation(
+                    1.0,
+                    height,
+                    std::f32::consts::FRAC_PI_2,
+                    bounds.x_min,
+                    bounds.y_min - Twips::HALF,
+                ),
+            );
+            // Right
+            context.commands.draw_line(
+                border_color,
+                Matrix::create_box_with_rotation(
+                    1.0,
+                    height,
+                    std::f32::consts::FRAC_PI_2,
+                    bounds.x_max,
+                    bounds.y_min - Twips::HALF,
+                ),
+            );
+        }
+    }
+
+    /// Draw the box (border + background) for EditText with embedded fonts.
+    ///
+    /// Notes on FP's behavior:
+    ///  * the box is always drawn (in contrast to device fonts) and may be transformed,
+    ///  * the box is anti aliased according to the quality, but
+    ///    is snapped to whole pixels in order not to look blurry,
+    ///  * however, on some qualities (e.g. medium) the border is sometimes drawn between pixels,
+    ///  * similarly for small box sizes, the border will be sometimes drawn between pixels,
+    ///  * line width of the border is always 1px regardless of zoom and transform,
+    ///  * the bottom-right corner of the border is NOT missing (usually), :)
+    ///  * however, sometimes the bottom-right corner will
+    ///    stick out a bit down (gee, can you even draw a rectangle Adobe?),
+    ///  * pixel snapping for width sometimes depends on x,
+    ///    but pixel snapping for height never depends on y (for high quality).
+    ///
+    /// Notes on the current implementation:
+    ///  * the box is rendered using a line rect,
+    ///    which is snapped to pixels using [`EditTextPixelSnapping`],
+    ///  * the pixel-perfect position is really hard to achieve, currently it's best-effort only.
+    pub fn draw_text_box(
+        &self,
+        context: &mut RenderContext<'_, 'gc>,
+        bounds: Rectangle<Twips>,
+        background_color: Option<Color>,
+        border_color: Option<Color>,
+    ) {
+        let quality = context.stage.quality();
+        let pixel_snapping = &EditTextPixelSnapping::new(quality);
+
+        let transform = context.transform_stack.transform();
+
+        let width = bounds.width().to_pixels() as f32;
+        let height = bounds.height().to_pixels() as f32;
+
+        let mut text_box =
+            transform.matrix * Matrix::create_box(width, height, bounds.x_min, bounds.y_min);
+        pixel_snapping.apply(&mut text_box);
+
+        if let Some(background_color) = background_color {
+            let background_color = &transform.color_transform * background_color;
+            context.commands.draw_rect(background_color, text_box);
+        }
+
+        if let Some(border_color) = border_color {
+            let border_color = &transform.color_transform * border_color;
+            context.commands.draw_line_rect(border_color, text_box);
+        }
     }
 }
 
@@ -2296,7 +2538,7 @@ impl<'gc> TInteractiveObject<'gc> for EditText<'gc> {
         event: ClipEvent,
     ) -> ClipEventResult {
         match event {
-            ClipEvent::Press | ClipEvent::MouseWheel { .. } | ClipEvent::MouseMove => {
+            ClipEvent::Press { .. } | ClipEvent::MouseWheel { .. } | ClipEvent::MouseMove => {
                 ClipEventResult::Handled
             }
             _ => ClipEventResult::NotHandled,
@@ -2323,17 +2565,12 @@ impl<'gc> TInteractiveObject<'gc> for EditText<'gc> {
             return ClipEventResult::Handled;
         }
 
-        if let ClipEvent::Press = event {
-            if self.is_editable() || self.is_selectable() {
-                let tracker = context.focus_tracker;
-                tracker.set(Some(self.into()), context);
-            }
-
+        if let ClipEvent::Press { index } = event {
             // We can't hold self as any link may end up modifying this object, so pull the info out
             let mut link_to_open = None;
 
             if let Some(position) = self.screen_position_to_index(*context.mouse_position) {
-                self.set_selection(Some(TextSelection::for_position(position)), context.gc());
+                self.handle_click(index, position, context);
 
                 if let Some((span_index, _)) =
                     self.0.read().text_spans.resolve_position_as_span(position)
@@ -2357,6 +2594,8 @@ impl<'gc> TInteractiveObject<'gc> for EditText<'gc> {
                     // TODO: This fires on mouse DOWN but it should be mouse UP...
                     // but only if it went down in the same span.
                     // Needs more advanced focus handling than we have at time of writing this comment.
+                    // TODO This also needs to fire only if the user clicked on the link,
+                    //   currently it fires when the cursor position resolves to one in the link.
                     self.open_url(context, &url, &target);
                 }
             }
@@ -2367,11 +2606,8 @@ impl<'gc> TInteractiveObject<'gc> for EditText<'gc> {
         if let ClipEvent::MouseMove = event {
             // If a mouse has moved and this EditTest is pressed, we need to update the selection.
             if InteractiveObject::option_ptr_eq(context.mouse_data.pressed, self.as_interactive()) {
-                if let Some(mut selection) = self.selection() {
-                    if let Some(position) = self.screen_position_to_index(*context.mouse_position) {
-                        selection.to = position;
-                        self.set_selection(Some(selection), context.gc());
-                    }
+                if let Some(position) = self.screen_position_to_index(*context.mouse_position) {
+                    self.handle_drag(position, context);
                 }
             }
         }
@@ -2453,6 +2689,10 @@ impl<'gc> TInteractiveObject<'gc> for EditText<'gc> {
         }
     }
 
+    fn is_focusable_by_mouse(&self, _context: &mut UpdateContext<'_, 'gc>) -> bool {
+        self.movie().is_action_script_3() || self.is_editable() || self.is_selectable()
+    }
+
     fn is_highlightable(&self, _context: &mut UpdateContext<'_, 'gc>) -> bool {
         // TextField is incapable of rendering a highlight.
         false
@@ -2477,6 +2717,8 @@ bitflags::bitflags! {
         const FIRING_VARIABLE_BINDING = 1 << 0;
         const HAS_BACKGROUND = 1 << 1;
         const DRAW_LAYOUT_BOXES = 1 << 2;
+        const CONDENSE_WHITE = 1 << 13;
+        const ALWAYS_SHOW_SELECTION = 1 << 14;
 
         // The following bits need to match `swf::EditTextFlag`.
         const READ_ONLY = 1 << 3;
@@ -2501,6 +2743,49 @@ struct EditTextStatic {
     id: CharacterId,
     layout: Option<swf::TextLayout>,
     initial_text: Option<WString>,
+}
+
+#[derive(Clone, Debug)]
+struct ClickEventData {
+    /// The position in text resolved from click coordinates.
+    position: usize,
+
+    click_index: usize,
+}
+
+impl ClickEventData {
+    /// Selection mode that results from this click index.
+    fn selection_mode(&self) -> TextSelectionMode {
+        TextSelectionMode::from_click_index(self.click_index)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum TextSelectionMode {
+    /// Specifies that text should be selected at char boundaries.
+    ///
+    /// Used when e.g. clicking or clicking and dragging.
+    Character,
+
+    /// Specifies that text should be selected at word boundaries.
+    ///
+    /// Used when e.g. double-clicking or double-clicking and dragging.
+    Word,
+
+    /// Specifies that text should be selected at line boundaries.
+    ///
+    /// Used when e.g. triple-clicking or triple-clicking and dragging.
+    Line,
+}
+
+impl TextSelectionMode {
+    fn from_click_index(click_index: usize) -> Self {
+        match click_index {
+            0 => Self::Character,
+            1 => Self::Word,
+            _ => Self::Line,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -2536,6 +2821,21 @@ impl TextSelection {
             from,
             to,
             blink_epoch: Utc::now(),
+        }
+    }
+
+    /// Create a new selection spanning across the given selections.
+    pub fn span_across(from: Self, to: Self) -> Self {
+        let from_start = from.start();
+        let from_end = from.end();
+        let to_start = to.start();
+        let to_end = to.end();
+        if from_start < to_start && from_end < to_end {
+            Self::for_range(from_start, to_end)
+        } else if to_start < from_start && to_end < from_end {
+            Self::for_range(from_end, to_start)
+        } else {
+            Self::for_range(from_start.min(to_start), from_end.max(to_end))
         }
     }
 
@@ -2804,5 +3104,48 @@ impl EditTextRestrict {
             }
         }
         filtered
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EditTextPixelSnapping {
+    quality: StageQuality,
+}
+
+impl EditTextPixelSnapping {
+    pub fn new(quality: StageQuality) -> Self {
+        Self { quality }
+    }
+
+    pub fn apply(&self, matrix: &mut Matrix) {
+        match self.quality {
+            StageQuality::Low => {
+                // We are snapping x and y in order to match the expected positions.
+                // However, we do not need to snap scale, because
+                // at low quality antialiasing is disabled anyway,
+                // and the aliased border is pretty close to the expected position.
+                matrix.tx = matrix.tx.round_to_pixel_ties_even();
+                matrix.ty = matrix.ty.round_to_pixel_ties_even();
+            }
+            _ => {
+                // For higher qualities, we need to snap x, y, and scales not only to match
+                // FP's positioning, but also for the border not to look blurry.
+                // The snapping here is fine-tuned for high quality (the default).
+                // It is not perfect (FP's logic is very complicated), but it's
+                // accurate for whole-pixel positions and relatively close for subpixel positions.
+                matrix.tx = (matrix.tx + Twips::new(2)).trunc_to_pixel();
+                matrix.ty = (matrix.ty + Twips::new(2)).trunc_to_pixel();
+                let x_snap = matrix.c.abs() < 0.001 || matrix.d.abs() < 0.001;
+                let y_snap = matrix.a.abs() < 0.001 || matrix.b.abs() < 0.001;
+                if x_snap {
+                    matrix.a = (matrix.a - 0.35).round_ties_even();
+                    matrix.b = (matrix.b - 0.35).round_ties_even();
+                }
+                if y_snap {
+                    matrix.c = (matrix.c - 0.35).round_ties_even();
+                    matrix.d = (matrix.d - 0.35).round_ties_even();
+                }
+            }
+        }
     }
 }

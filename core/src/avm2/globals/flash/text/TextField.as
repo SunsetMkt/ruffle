@@ -132,6 +132,7 @@ package flash.text {
         public native function replaceSelectedText(value:String):void;
         public native function replaceText(beginIndex:int, endIndex:int, newText:String):void;
         public native function setSelection(beginIndex:int, endIndex:int):void;
+        public native function getTextRuns():Array;
 
         public native function get selectedText():String;
 
@@ -139,10 +140,7 @@ package flash.text {
             stub_method("flash.text.TextField", "insertXMLText");
         }
 
-        public function getCharIndexAtPoint(x:Number, y:Number):int {
-            stub_method("flash.text.TextField", "getCharIndexAtPoint");
-            return 0;
-        }
+        public native function getCharIndexAtPoint(x:Number, y:Number):int;
 
         public native function getLineLength(lineIndex:int):int;
 
@@ -155,27 +153,18 @@ package flash.text {
             return new Rectangle(0, 0, 1, 1);
         }
 
-        public function getFirstCharInParagraph(charIndex:int):int {
-            stub_method("flash.text.TextField", "getFirstCharInParagraph");
-            return 0;
-        }
+        public native function getFirstCharInParagraph(charIndex:int):int;
 
         public function getImageReference(id:String):DisplayObject {
             stub_method("flash.text.TextField", "getImageReference");
             return null;
         }
 
-        public function getLineIndexAtPoint(x:Number, y:Number):int {
-            stub_method("flash.text.TextField", "getLineIndexAtPoint");
-            return 0;
-        }
+        public native function getLineIndexAtPoint(x:Number, y:Number):int;
 
         public native function getLineIndexOfChar(charIndex:int):int;
 
-        public function getParagraphLength(charIndex:int):int {
-            stub_method("flash.text.TextField", "getParagraphLength");
-            return 0;
-        }
+        public native function getParagraphLength(charIndex:int):int;
 
         public static function isFontCompatible(fontName:String, fontStyle:String):Boolean {
             stub_method("flash.text.TextField", "isFontCompatible");

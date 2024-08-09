@@ -94,16 +94,12 @@ pub fn init<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     // We set the underlying BitmapData instance - we start out with a dummy BitmapDataWrapper,
     // which makes custom classes see a disposed BitmapData before they call super()
-    let name = this.instance_class().map(|c| c.name());
-    let character = this
-        .instance_of()
-        .and_then(|t| {
-            activation
-                .context
-                .library
-                .avm2_class_registry()
-                .class_symbol(t)
-        })
+    let name = this.instance_class().name();
+    let character = activation
+        .context
+        .library
+        .avm2_class_registry()
+        .class_symbol(this.instance_class())
         .and_then(|(movie, chara_id)| {
             activation
                 .context
@@ -339,9 +335,7 @@ pub fn copy_pixels_to_byte_array<'gc>(
         bitmap_data.check_valid(activation)?;
         let rectangle = args.get_object(activation, 0, "rect")?;
         let storage = args.get_object(activation, 1, "data")?;
-        let mut storage = storage
-            .as_bytearray_mut(activation.context.gc_context)
-            .unwrap();
+        let mut storage = storage.as_bytearray_mut().unwrap();
         let (x, y, width, height) = get_rectangle_x_y_width_height(activation, rectangle)?;
         operations::get_pixels_as_byte_array(
             activation,
@@ -484,7 +478,7 @@ pub fn set_pixels<'gc>(
         let (x, y, width, height) = get_rectangle_x_y_width_height(activation, rectangle)?;
 
         let mut ba_write = bytearray
-            .as_bytearray_mut(activation.context.gc_context)
+            .as_bytearray_mut()
             .ok_or("ArgumentError: Parameter must be a bytearray")?;
 
         operations::set_pixels_from_byte_array(
@@ -785,7 +779,7 @@ pub fn hit_test<'gc>(
                 .rectangle
                 .inner_class_definition();
 
-            if compare_object.is_of_type(point_class, &mut activation.context) {
+            if compare_object.is_of_type(point_class) {
                 let test_point = (
                     compare_object
                         .get_public_property("x", activation)?
@@ -802,7 +796,7 @@ pub fn hit_test<'gc>(
                     source_threshold,
                     test_point,
                 )));
-            } else if compare_object.is_of_type(rectangle_class, &mut activation.context) {
+            } else if compare_object.is_of_type(rectangle_class) {
                 let test_point = (
                     compare_object
                         .get_public_property("x", activation)?

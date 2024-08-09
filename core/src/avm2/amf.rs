@@ -136,7 +136,7 @@ pub fn serialize_value<'gc>(
             } else if let Some(bytearray) = o.as_bytearray() {
                 Some(AmfValue::ByteArray(bytearray.bytes().to_vec()))
             } else {
-                let class = o.instance_class().expect("Missing Class");
+                let class = o.instance_class();
                 let name = class_to_alias(activation, class);
 
                 let mut attributes = EnumSet::empty();
@@ -202,39 +202,39 @@ pub fn recursive_serialize<'gc>(
     object_table: &mut ObjectTable<'gc>,
 ) -> Result<(), Error<'gc>> {
     if let Some(static_properties) = static_properties {
-        if let Some(vtable) = obj.vtable() {
-            let mut props = vtable.public_properties();
-            // Flash appears to use vtable iteration order, but we sort ours
-            // to make our test output consistent.
-            props.sort_by_key(|(name, _)| name.to_utf8_lossy().to_string());
-            for (name, prop) in props {
-                if let Property::Virtual { get, set } = prop {
-                    if !(get.is_some() && set.is_some()) {
-                        continue;
-                    }
+        let vtable = obj.vtable();
+        let mut props = vtable.public_properties();
+        // Flash appears to use vtable iteration order, but we sort ours
+        // to make our test output consistent.
+        props.sort_by_key(|(name, _)| name.to_utf8_lossy().to_string());
+        for (name, prop) in props {
+            if let Property::Virtual { get, set } = prop {
+                if !(get.is_some() && set.is_some()) {
+                    continue;
                 }
-                let value = obj.get_public_property(name, activation)?;
-                let name = name.to_utf8_lossy().to_string();
-                if let Some(elem) = get_or_create_element(
-                    activation,
-                    name.clone(),
-                    value,
-                    object_table,
-                    amf_version,
-                ) {
-                    elements.push(elem);
-                    static_properties.push(name);
-                }
+            }
+            let value = obj.get_public_property(name, activation)?;
+            let name = name.to_utf8_lossy().to_string();
+            if let Some(elem) =
+                get_or_create_element(activation, name.clone(), value, object_table, amf_version)
+            {
+                elements.push(elem);
+                static_properties.push(name);
             }
         }
     }
 
+    // FIXME: Flash only seems to use this enumeration for dynamic classes.
     let mut last_index = obj.get_next_enumerant(0, activation)?;
     while let Some(index) = last_index {
+        if index == 0 {
+            break;
+        }
+
         let name = obj
             .get_enumerant_name(index, activation)?
             .coerce_to_string(activation)?;
-        let value = obj.get_public_property(name, activation)?;
+        let value = obj.get_enumerant_value(index, activation)?;
 
         let name = name.to_utf8_lossy().to_string();
         if let Some(elem) =
@@ -339,12 +339,27 @@ pub fn deserialize_value<'gc>(
             let obj = target_class.construct(activation, &[])?;
 
             for entry in elements {
+                let name = entry.name();
                 let value = deserialize_value(activation, entry.value())?;
-                obj.set_public_property(
-                    AvmString::new_utf8(activation.context.gc_context, entry.name()),
+                // Flash player logs the error and continues deserializing the rest of the object,
+                // even when calling a customer setter
+                if let Err(e) = obj.set_public_property(
+                    AvmString::new_utf8(activation.context.gc_context, name),
                     value,
                     activation,
-                )?;
+                ) {
+                    tracing::warn!(
+                        "Ignoring error deserializing AMF property for field {name:?}: {e:?}"
+                    );
+                    if let Error::AvmError(e) = e {
+                        if let Some(e) = e.as_object().and_then(|o| o.as_error_object()) {
+                            // Flash player *traces* the error (without a stacktrace)
+                            activation.context.avm_trace(
+                                &e.display().expect("Failed to display error").to_string(),
+                            );
+                        }
+                    }
+                }
             }
             obj.into()
         }

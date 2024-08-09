@@ -1,5 +1,3 @@
-/* eslint-env node */
-
 import fs from "fs";
 import url from "url";
 import json5 from "json5";
@@ -101,7 +99,7 @@ export default function (/** @type {Record<string, any>} */ env, _argv) {
         },
         output: {
             path: url.fileURLToPath(new URL("assets/dist/", import.meta.url)),
-            publicPath: "",
+            publicPath: "auto",
             clean: true,
             assetModuleFilename: "assets/[name][ext][query]",
         },
@@ -127,6 +125,7 @@ export default function (/** @type {Record<string, any>} */ env, _argv) {
         optimization: {
             minimize: false,
         },
+        devtool: mode === "development" ? "source-map" : false,
         plugins: [
             new CopyPlugin({
                 patterns: [

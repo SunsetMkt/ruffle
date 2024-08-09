@@ -94,5 +94,20 @@
     },
     "settings_saved": {
         "message": "Beállítások elmentve"
+    },
+    "onboarding_page": {
+        "message": "Bevezető oldal"
+    },
+    "permissions_grant": {
+        "message": "Engedélyezem a Ruffle-nek, hogy hozzáférjen az adataimhoz az összes webhelyen"
+    },
+    "permissions_not_granted": {
+        "message": "A Ruffle ikonra kell kattintanod minden olyan webhelyen, ahol a Ruffle-t használni szeretnéd"
+    },
+    "grant_single_site_permission": {
+        "message": "Végleges engedélyezés ezen a webhelyen"
+    },
+    "swf_player_permissions": {
+        "message": "Engedélyt kell adnia ennek az URL-eredetnek, hogy SWF-eket tölthessen be róla."
     }
 }

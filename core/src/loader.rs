@@ -343,6 +343,65 @@ impl<'gc> LoadManager<'gc> {
         loader.movie_loader(player, request, loader_url)
     }
 
+    pub fn load_asset_movie(
+        player: Weak<Mutex<Player>>,
+        request: Request,
+        importer_movie: Arc<SwfMovie>,
+    ) -> OwnedFuture<(), Error> {
+        let player = player
+            .upgrade()
+            .expect("Could not upgrade weak reference to player");
+
+        Box::pin(async move {
+            let fetch = player.lock().unwrap().navigator().fetch(request);
+
+            match Loader::wait_for_full_response(fetch).await {
+                Ok((body, url, _status, _redirected)) => {
+                    let content_type = ContentType::sniff(&body);
+                    tracing::info!("Loading imported movie: {:?}", url);
+                    match content_type {
+                        ContentType::Swf => {
+                            let movie = SwfMovie::from_data(&body, url.clone(), Some(url.clone()))
+                                .expect("Could not load movie");
+
+                            let movie = Arc::new(movie);
+
+                            player.lock().unwrap().mutate_with_update_context(|uc| {
+                                let clip = MovieClip::new_import_assets(uc, movie, importer_movie);
+
+                                clip.set_cur_preload_frame(uc.gc_context, 0);
+                                let mut execution_limit = ExecutionLimit::none();
+
+                                tracing::debug!("Preloading swf to run exports {:?}", url);
+
+                                // Create library for exports before preloading
+                                uc.library.library_for_movie_mut(clip.movie());
+                                let res = clip.preload(uc, &mut execution_limit);
+                                tracing::debug!(
+                                    "Preloaded swf to run exports result {:?} {}",
+                                    url,
+                                    res
+                                );
+                            });
+                            Ok(())
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "Unsupported content type for ImportAssets: {:?}",
+                                content_type
+                            );
+                            Ok(())
+                        }
+                    }
+                }
+                Err(e) => Err(Error::FetchError(format!(
+                    "Could not fetch: {:?} because {:?}",
+                    e.url, e.error
+                ))),
+            }
+        })
+    }
+
     /// Kick off a movie clip load.
     ///
     /// Returns the loader's async process, which you will need to spawn.
@@ -958,13 +1017,12 @@ impl<'gc> Loader<'gc> {
                 error.error
             })?;
             let url = response.url().into_owned();
-            let body = response.body().await.map_err(|error| {
+            let body = response.body().await.inspect_err(|_error| {
                 player
                     .lock()
                     .unwrap()
                     .ui()
                     .display_root_movie_download_failed_message(true);
-                error
             })?;
 
             // The spoofed root movie URL takes precedence over the actual URL.
@@ -981,13 +1039,12 @@ impl<'gc> Loader<'gc> {
                 .unwrap_or(swf_url);
 
             let mut movie =
-                SwfMovie::from_data(&body, spoofed_or_swf_url, None).map_err(|error| {
+                SwfMovie::from_data(&body, spoofed_or_swf_url, None).inspect_err(|_error| {
                     player
                         .lock()
                         .unwrap()
                         .ui()
                         .display_root_movie_download_failed_message(true);
-                    error
                 })?;
             on_metadata(movie.header());
             movie.append_parameters(parameters);
@@ -1597,6 +1654,12 @@ impl<'gc> Loader<'gc> {
                         Avm2::dispatch_event(uc, complete_evt, target);
                     }
                     Err(response) => {
+                        tracing::error!(
+                            "Error during URLLoader load of {:?}: {:?}",
+                            response.url,
+                            response.error
+                        );
+
                         // Testing with Flash shoes that the 'data' property is cleared
                         // when an error occurs
 
@@ -2027,7 +2090,7 @@ impl<'gc> Loader<'gc> {
             loader_info
                 .as_loader_info_object()
                 .unwrap()
-                .set_content_type(sniffed_type, activation.context.gc_context);
+                .set_content_type(sniffed_type);
             let fake_movie = Arc::new(SwfMovie::fake_with_compressed_len(
                 activation.context.swf.version(),
                 data.len(),
@@ -2253,7 +2316,7 @@ impl<'gc> Loader<'gc> {
                         ));
 
                         let loader_info = loader_info.as_loader_info_object().unwrap();
-                        loader_info.set_errored(true, activation.context.gc_context);
+                        loader_info.set_errored(true);
 
                         loader_info.set_loader_stream(
                             LoaderStream::NotYetLoaded(fake_movie, None, false),

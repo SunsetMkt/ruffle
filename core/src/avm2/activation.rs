@@ -5,8 +5,7 @@ use crate::avm2::class::Class;
 use crate::avm2::domain::Domain;
 use crate::avm2::e4x::{escape_attribute_value, escape_element_value};
 use crate::avm2::error::{
-    make_error_1127, make_error_1506, make_null_or_undefined_error, make_reference_error,
-    type_error, ReferenceErrorCode,
+    make_error_1065, make_error_1127, make_error_1506, make_null_or_undefined_error, type_error,
 };
 use crate::avm2::method::{BytecodeMethod, Method, ResolvedParamConfig};
 use crate::avm2::object::{
@@ -29,8 +28,7 @@ use smallvec::SmallVec;
 use std::cmp::{min, Ordering};
 use std::sync::Arc;
 use swf::avm2::types::{
-    Class as AbcClass, Exception, Index, Method as AbcMethod, MethodFlags as AbcMethodFlags,
-    Namespace as AbcNamespace,
+    Exception, Index, Method as AbcMethod, MethodFlags as AbcMethodFlags, Namespace as AbcNamespace,
 };
 
 use super::error::make_mismatch_error;
@@ -753,15 +751,6 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             .load_method(index, is_function, self)
     }
 
-    /// Retrieve a class entry from the current ABC file's method table.
-    fn table_class(
-        &mut self,
-        method: Gc<'gc, BytecodeMethod<'gc>>,
-        index: Index<AbcClass>,
-    ) -> Result<Class<'gc>, Error<'gc>> {
-        method.translation_unit().load_class(index.0, self)
-    }
-
     pub fn run_actions(
         &mut self,
         method: Gc<'gc, BytecodeMethod<'gc>>,
@@ -815,10 +804,13 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 } else if let Ok(err_object) = err_object {
                     let target_class = e.target_class.expect("Just confirmed to be non-None");
 
-                    matches = err_object.is_of_type(target_class, &mut self.context);
+                    matches = err_object.is_of_type(target_class);
                 }
 
                 if matches {
+                    #[cfg(feature = "avm_debug")]
+                    tracing::info!(target: "avm_caught", "Caught exception: {:?}", Error::AvmError(error));
+
                     self.clear_stack();
                     self.push_stack(error);
 
@@ -938,16 +930,19 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 Op::NewActivation => self.op_new_activation(),
                 Op::NewObject { num_args } => self.op_new_object(*num_args),
                 Op::NewFunction { index } => self.op_new_function(method, *index),
-                Op::NewClass { index } => self.op_new_class(method, *index),
+                Op::NewClass { class } => self.op_new_class(*class),
                 Op::ApplyType { num_types } => self.op_apply_type(*num_types),
                 Op::NewArray { num_args } => self.op_new_array(*num_args),
                 Op::CoerceA => Ok(FrameControl::Continue),
                 Op::CoerceB => self.op_coerce_b(),
                 Op::CoerceD => self.op_coerce_d(),
+                Op::CoerceDSwapPop => self.op_coerce_d_swap_pop(),
                 Op::CoerceI => self.op_coerce_i(),
+                Op::CoerceISwapPop => self.op_coerce_i_swap_pop(),
                 Op::CoerceO => self.op_coerce_o(),
                 Op::CoerceS => self.op_coerce_s(),
                 Op::CoerceU => self.op_coerce_u(),
+                Op::CoerceUSwapPop => self.op_coerce_u_swap_pop(),
                 Op::ConvertO => self.op_convert_o(),
                 Op::ConvertS => self.op_convert_s(),
                 Op::Add => self.op_add(),
@@ -1028,6 +1023,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                     self.op_lookup_switch(lookup_switch.default_offset, &lookup_switch.case_offsets)
                 }
                 Op::Coerce { class } => self.op_coerce(*class),
+                Op::CoerceSwapPop { class } => self.op_coerce_swap_pop(*class),
                 Op::CheckFilter => self.op_check_filter(),
                 Op::Si8 => self.op_si8(),
                 Op::Si16 => self.op_si16(),
@@ -1599,9 +1595,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let vname = ex.variable_name;
 
         let so = if let Some(vname) = vname {
-            ScriptObject::catch_scope(self.context.gc_context, &vname)
+            ScriptObject::catch_scope(self, &vname)
         } else {
-            // for `finally` scopes, FP just creates a bare object.
+            // for `finally` scopes, FP just creates a normal object.
             self.avm2().classes().object.construct(self, &[])?
         };
 
@@ -1698,10 +1694,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         avm_debug!(self.context.avm2, "Resolving {:?}", *multiname);
 
         let multiname = multiname.fill_with_runtime_params(self)?;
-        let found: Result<Object<'gc>, Error<'gc>> =
-            self.find_definition(&multiname)?.ok_or_else(|| {
-                make_reference_error(self, ReferenceErrorCode::InvalidLookup, &multiname, None)
-            });
+        let found: Result<Object<'gc>, Error<'gc>> = self
+            .find_definition(&multiname)?
+            .ok_or_else(|| make_error_1065(self, &multiname));
         let result: Value<'gc> = found?.into();
 
         self.push_stack(result);
@@ -1732,11 +1727,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             // Even if it's an object with the "descendants" property, we won't support it.
             let class_name = object
                 .instance_class()
-                .map(|cls| {
-                    cls.name()
-                        .to_qualified_name_err_message(self.context.gc_context)
-                })
-                .unwrap_or_else(|| AvmString::from("<UNKNOWN>"));
+                .name()
+                .to_qualified_name_err_message(self.context.gc_context);
             return Err(Error::AvmError(type_error(
                 self,
                 &format!(
@@ -1878,11 +1870,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         Ok(FrameControl::Continue)
     }
 
-    fn op_new_class(
-        &mut self,
-        method: Gc<'gc, BytecodeMethod<'gc>>,
-        index: Index<AbcClass>,
-    ) -> Result<FrameControl<'gc>, Error<'gc>> {
+    fn op_new_class(&mut self, class: Class<'gc>) -> Result<FrameControl<'gc>, Error<'gc>> {
         let base_value = self.pop_stack();
         let base_class = match base_value {
             Value::Object(o) => match o.as_class_object() {
@@ -1893,9 +1881,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             _ => return Err("Base class for new class is not Object or null.".into()),
         };
 
-        let class_entry = self.table_class(method, index)?;
-
-        let new_class = ClassObject::from_class(self, class_entry, base_class)?;
+        let new_class = ClassObject::from_class(self, class, base_class)?;
 
         self.push_raw(new_class);
 
@@ -1942,8 +1928,26 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         Ok(FrameControl::Continue)
     }
 
+    fn op_coerce_d_swap_pop(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
+        let value = self.pop_stack().coerce_to_number(self)?;
+        let _ = self.pop_stack();
+
+        self.push_raw(value);
+
+        Ok(FrameControl::Continue)
+    }
+
     fn op_coerce_i(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
         let value = self.pop_stack().coerce_to_i32(self)?;
+
+        self.push_raw(value);
+
+        Ok(FrameControl::Continue)
+    }
+
+    fn op_coerce_i_swap_pop(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
+        let value = self.pop_stack().coerce_to_i32(self)?;
+        let _ = self.pop_stack();
 
         self.push_raw(value);
 
@@ -1968,6 +1972,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let coerced = match value {
             Value::Undefined | Value::Null => Value::Null,
+            Value::String(_) => value,
             _ => value.coerce_to_string(self)?.into(),
         };
 
@@ -1978,6 +1983,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
     fn op_coerce_u(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
         let value = self.pop_stack().coerce_to_u32(self)?;
+
+        self.push_raw(value);
+
+        Ok(FrameControl::Continue)
+    }
+
+    fn op_coerce_u_swap_pop(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
+        let value = self.pop_stack().coerce_to_u32(self)?;
+        let _ = self.pop_stack();
 
         self.push_raw(value);
 
@@ -2007,8 +2021,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let xml_list = self.avm2().classes().xml_list.inner_class_definition();
         let value = self.pop_stack().coerce_to_object_or_typeerror(self, None)?;
 
-        if value.is_of_type(xml, &mut self.context) || value.is_of_type(xml_list, &mut self.context)
-        {
+        if value.is_of_type(xml) || value.is_of_type(xml_list) {
             self.push_stack(value);
         } else {
             return Err(Error::AvmError(type_error(
@@ -2726,25 +2739,24 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             Value::Bool(_) => "boolean",
             Value::Number(_) | Value::Integer(_) => "number",
             Value::Object(o) => {
-                // Subclasses always have a typeof = "object", must be a subclass if the prototype chain is > 2, or not a subclass if <=2
-                let is_not_subclass = o
-                    .proto()
-                    .and_then(|p| p.proto())
-                    .and_then(|p| p.proto())
-                    .is_none();
+                let classes = self.avm2().classes();
 
                 match o {
                     Object::FunctionObject(_) => {
-                        if is_not_subclass {
+                        if o.instance_class() == classes.function.inner_class_definition() {
                             "function"
                         } else {
+                            // Subclasses always have a typeof = "object"
                             "object"
                         }
                     }
                     Object::XmlObject(_) | Object::XmlListObject(_) => {
-                        if is_not_subclass {
+                        if o.instance_class() == classes.xml_list.inner_class_definition()
+                            || o.instance_class() == classes.xml.inner_class_definition()
+                        {
                             "xml"
                         } else {
+                            // Subclasses always have a typeof = "object"
                             "object"
                         }
                     }
@@ -2815,6 +2827,16 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         Ok(FrameControl::Continue)
     }
 
+    fn op_coerce_swap_pop(&mut self, class: Class<'gc>) -> Result<FrameControl<'gc>, Error<'gc>> {
+        let val = self.pop_stack();
+        let _ = self.pop_stack();
+
+        let x = val.coerce_to_type(self, class)?;
+
+        self.push_stack(x);
+        Ok(FrameControl::Continue)
+    }
+
     pub fn domain(&self) -> Domain<'gc> {
         self.outer.domain()
     }
@@ -2830,7 +2852,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let dm = self.domain_memory();
         let mut dm = dm
-            .as_bytearray_mut(self.context.gc_context)
+            .as_bytearray_mut()
             .expect("Bytearray storage should exist");
 
         let Ok(address) = usize::try_from(address) else {
@@ -2853,7 +2875,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let dm = self.domain_memory();
         let mut dm = dm
-            .as_bytearray_mut(self.context.gc_context)
+            .as_bytearray_mut()
             .expect("Bytearray storage should exist");
 
         let Ok(address) = usize::try_from(address) else {
@@ -2875,7 +2897,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let dm = self.domain_memory();
         let mut dm = dm
-            .as_bytearray_mut(self.context.gc_context)
+            .as_bytearray_mut()
             .expect("Bytearray storage should exist");
 
         let Ok(address) = usize::try_from(address) else {
@@ -2897,7 +2919,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let dm = self.domain_memory();
         let mut dm = dm
-            .as_bytearray_mut(self.context.gc_context)
+            .as_bytearray_mut()
             .expect("Bytearray storage should exist");
 
         let Ok(address) = usize::try_from(address) else {
@@ -2919,7 +2941,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let dm = self.domain_memory();
         let mut dm = dm
-            .as_bytearray_mut(self.context.gc_context)
+            .as_bytearray_mut()
             .expect("Bytearray storage should exist");
 
         let Ok(address) = usize::try_from(address) else {

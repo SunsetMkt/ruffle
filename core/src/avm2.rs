@@ -81,8 +81,8 @@ pub use crate::avm2::globals::flash::ui::context_menu::make_context_menu_state;
 pub use crate::avm2::multiname::Multiname;
 pub use crate::avm2::namespace::Namespace;
 pub use crate::avm2::object::{
-    ArrayObject, BitmapDataObject, ClassObject, EventObject, Object, ScriptObject,
-    SoundChannelObject, StageObject, TObject,
+    ArrayObject, BitmapDataObject, ClassObject, EventObject, Object, SoundChannelObject,
+    StageObject, TObject,
 };
 pub use crate::avm2::qname::QName;
 pub use crate::avm2::value::Value;
@@ -431,33 +431,62 @@ impl<'gc> Avm2<'gc> {
     /// Dispatch an event on an object.
     ///
     /// This will become its own self-contained activation and swallow
-    /// any resulting resulting error (after logging).
+    /// any resulting error (after logging).
     ///
     /// Attempts to dispatch a non-event object will panic.
+    ///
+    /// Returns `true` if the event has been handled.
     pub fn dispatch_event(
         context: &mut UpdateContext<'_, 'gc>,
         event: Object<'gc>,
         target: Object<'gc>,
-    ) {
+    ) -> bool {
+        Self::dispatch_event_internal(context, event, target, false)
+    }
+
+    /// Simulate dispatching an event.
+    ///
+    /// This method is similar to [`Self::dispatch_event`],
+    /// but it does not execute event handlers.
+    ///
+    /// Returns `true` when the event would have been handled if not simulated.
+    pub fn simulate_event_dispatch(
+        context: &mut UpdateContext<'_, 'gc>,
+        event: Object<'gc>,
+        target: Object<'gc>,
+    ) -> bool {
+        Self::dispatch_event_internal(context, event, target, true)
+    }
+
+    fn dispatch_event_internal(
+        context: &mut UpdateContext<'_, 'gc>,
+        event: Object<'gc>,
+        target: Object<'gc>,
+        simulate_dispatch: bool,
+    ) -> bool {
         let event_name = event
             .as_event()
             .map(|e| e.event_type())
             .unwrap_or_else(|| panic!("cannot dispatch non-event object: {:?}", event));
 
         let mut activation = Activation::from_nothing(context.reborrow());
-        if let Err(err) = events::dispatch_event(&mut activation, target, event) {
-            tracing::error!(
-                "Encountered AVM2 error when dispatching `{}` event: {:?}",
-                event_name,
-                err,
-            );
-            // TODO: push the error onto `loaderInfo.uncaughtErrorEvents`
+        match events::dispatch_event(&mut activation, target, event, simulate_dispatch) {
+            Err(err) => {
+                tracing::error!(
+                    "Encountered AVM2 error when dispatching `{}` event: {:?}",
+                    event_name,
+                    err,
+                );
+                // TODO: push the error onto `loaderInfo.uncaughtErrorEvents`
+                false
+            }
+            Ok(handled) => handled,
         }
     }
 
     /// Add an object to the broadcast list.
     ///
-    /// Each broadcastable event contains it's own broadcast list. You must
+    /// Each broadcastable event contains its own broadcast list. You must
     /// register all objects that have event handlers with that event's
     /// broadcast list by calling this function. Attempting to register a
     /// broadcast listener for a non-broadcast event will do nothing.
@@ -536,8 +565,9 @@ impl<'gc> Avm2<'gc> {
             if let Some(object) = object.and_then(|obj| obj.upgrade(context.gc_context)) {
                 let mut activation = Activation::from_nothing(context.reborrow());
 
-                if object.is_of_type(on_type.inner_class_definition(), &mut activation.context) {
-                    if let Err(err) = events::dispatch_event(&mut activation, object, event) {
+                if object.is_of_type(on_type.inner_class_definition()) {
+                    if let Err(err) = events::dispatch_event(&mut activation, object, event, false)
+                    {
                         tracing::error!(
                             "Encountered AVM2 error when broadcasting `{}` event: {:?}",
                             event_name,

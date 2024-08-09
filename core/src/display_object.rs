@@ -971,7 +971,6 @@ pub fn render_base<'gc>(this: DisplayObject<'gc>, context: &mut RenderContext<'_
                 Matrix::create_box(
                     bounds.width().to_pixels() as f32,
                     bounds.height().to_pixels() as f32,
-                    0.0,
                     bounds.x_min,
                     bounds.y_min,
                 ),
@@ -1147,6 +1146,17 @@ pub trait TDisplayObject<'gc>:
     /// The world bounding box of this object including children, relative to the stage.
     fn world_bounds(&self) -> Rectangle<Twips> {
         self.bounds_with_transform(&self.local_to_global_matrix())
+    }
+
+    /// Bounds used for drawing debug rects and picking objects.
+    fn debug_rect_bounds(&self) -> Rectangle<Twips> {
+        // Make the rect at least as big as highlight bounds to ensure that anything
+        // interactive is also highlighted even if not included in world bounds.
+        let highlight_bounds = self
+            .as_interactive()
+            .map(|int| int.highlight_bounds())
+            .unwrap_or_default();
+        self.world_bounds().union(&highlight_bounds)
     }
 
     /// Gets the bounds of this object and all children, transformed by a given matrix.
@@ -1656,7 +1666,8 @@ pub trait TDisplayObject<'gc>:
         remove_old_link: bool,
     ) {
         if remove_old_link {
-            if let Some(old_masker) = self.base().masker() {
+            let old_masker = self.base().masker();
+            if let Some(old_masker) = old_masker {
                 old_masker.set_maskee(gc_context, None, false);
             }
             if let Some(parent) = self.parent() {
@@ -1676,7 +1687,8 @@ pub trait TDisplayObject<'gc>:
         remove_old_link: bool,
     ) {
         if remove_old_link {
-            if let Some(old_maskee) = self.base().maskee() {
+            let old_maskee = self.base().maskee();
+            if let Some(old_maskee) = old_maskee {
                 old_maskee.set_masker(gc_context, None, false);
             }
             self.invalidate_cached_bitmap(gc_context);
@@ -1982,7 +1994,7 @@ pub trait TDisplayObject<'gc>:
             // the corresponding `SymbolClass` *not* extend `MovieClip` (e.g. extending `Sprite` directly.)
             // When this occurs, Flash Player will run the first frame, and immediately stop.
             // However, Flash Player runs frames for the root movie clip, even if it doesn't extend `MovieClip`.
-            if !obj.is_of_type(movieclip_class, context) && !movie.is_root() {
+            if !obj.is_of_type(movieclip_class) && !movie.is_root() {
                 movie.stop(context);
             }
             movie.set_initialized(context.gc_context);
@@ -2142,6 +2154,10 @@ pub trait TDisplayObject<'gc>:
                 stage_object.unregister_text_field_bindings(context);
             }
         }
+
+        context
+            .audio_manager
+            .stop_sounds_with_display_object(context.audio, (*self).into());
 
         self.set_avm1_removed(context.gc_context, true);
     }

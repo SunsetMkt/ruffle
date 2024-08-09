@@ -22,15 +22,13 @@ pub fn init<'gc>(
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(sound_object) = this.as_sound_object() {
-        let class_object = this
-            .instance_of()
-            .ok_or("Attempted to construct Sound on a bare object.")?;
+        let class_def = this.instance_class();
 
         if let Some((movie, symbol)) = activation
             .context
             .library
             .avm2_class_registry()
-            .class_symbol(class_object)
+            .class_symbol(class_def)
         {
             if let Some(Character::Sound(sound)) = activation
                 .context
@@ -41,7 +39,7 @@ pub fn init<'gc>(
                 let sound = *sound;
                 sound_object.set_sound(&mut activation.context, sound)?;
             } else {
-                tracing::warn!("Attempted to construct subclass of Sound, {}, which is associated with non-Sound character {}", class_object.inner_class_definition().name().local_name(), symbol);
+                tracing::warn!("Attempted to construct subclass of Sound, {}, which is associated with non-Sound character {}", class_def.name().local_name(), symbol);
             }
         }
     }
@@ -210,7 +208,7 @@ pub fn extract<'gc>(
         .unwrap_or(&Value::Number(0.0))
         .coerce_to_number(activation)?;
 
-    if let Some(mut bytearray) = bytearray.as_bytearray_mut(activation.context.gc_context) {
+    if let Some(mut bytearray) = bytearray.as_bytearray_mut() {
         bytearray
             .write_bytes(vec![0u8; length.ceil() as usize].as_slice())
             .map_err(|e| e.to_avm(activation))?;
